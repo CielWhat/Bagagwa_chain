@@ -1105,3 +1105,20 @@ export function makeBagagwaEngine(X) {
         get uafTriggered() { return S.uafTriggered; },
     };
 }
+// ============================================================================
+// Replace the old try/catch block at the end of bagagwa.js with this.
+// ============================================================================
+(function bootstrapBagagwa() {
+    "use strict";
+
+    const OUT = (s) => { try { log(s); } catch (e) {} };
+
+    OUT("Globals: " + Object.keys(globalThis).filter(k =>
+        !k.startsWith("__") && k.length < 30
+    ).join(", "));
+    OUT("P=" + typeof P + " p=" + typeof p + " sys=" + typeof sys +
+        " syscall=" + typeof syscall + " chain=" + typeof chain +
+        " currentChain=" + typeof currentChain + " int64=" + typeof int64 +
+        " worker_rop=" + typeof worker_rop + " mem=" + typeof mem +
+        " track=" + typeof track + " flushMark=" + typeof flushMark);
+})();

