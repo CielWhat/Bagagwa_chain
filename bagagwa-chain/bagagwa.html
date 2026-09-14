@@ -51,7 +51,7 @@
 <button id="btn" disabled>Run Exploit</button>
 <div id="presets" style="margin:10px 0;display:flex;gap:8px;flex-wrap:wrap;justify-content:center;">
   <button data-q="?x=10" style="padding:10px 14px;font-size:15px;font-weight:700;background:#1c2a1e;border:2px solid #47c76a;border-radius:8px;color:#b8f0c6;cursor:pointer;">Boot</button>
-  <button data-url="notify.html?call=0x1C950&go=1" style="padding:10px 14px;font-size:15px;background:#223146;border:2px solid #5e81ac;border-radius:8px;color:#cfe3ff;cursor:pointer;">Test aio_create stub</button>
+  <button data-url="notify.html?call=0x1C950&go=1&car=2000000" style="padding:10px 14px;font-size:15px;background:#223146;border:2px solid #5e81ac;border-radius:8px;color:#cfe3ff;cursor:pointer;">Test aio_create stub</button>
 </div>
 <script>
 document.querySelectorAll("#presets button").forEach(function (b) {
@@ -112,7 +112,7 @@ function _persist(msg) {
     } catch(e) {}
 }
 
-const BGW_REV = "x23-stubtest";
+const BGW_REV = "x24-stubtest16m";
 let __beaconOff = false;
 function beacon(line) {
     // Async image GET: never blocks the exploit (unlike sync XHR), so safe
