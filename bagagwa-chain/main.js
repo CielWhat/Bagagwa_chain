@@ -607,6 +607,16 @@ async function prepare(p) {
     }
     jbmark("PREP-GETPID-OK", "pid=" + pid.low);
 
+    // CALL-BATTERY: distinguish ROP-chain degradation (crash at call N) from
+    // a bad stub RVA (all pass here, crash only at aio_create in stage 0).
+    // getpid x4 (0-arg, known good) + aio_init repeat (2-arg, known good).
+    for (let bi = 0; bi < 4; bi++) {
+        const bp = await chain.syscall(SYS_GETPID);
+        jbmark("PREP-BATTERY", "n=" + bi + "-pid=" + bp.low);
+    }
+    const bai = await chain.syscall(SYS_AIO_INIT, 0, 0);
+    jbmark("PREP-BATTERY-INIT", "raw=0x" + bai.toString());
+
     return { p: p2, chain: chain };
 }
 let fwScript = document.createElement('script');
